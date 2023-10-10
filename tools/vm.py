@@ -78,7 +78,7 @@ vm.add_argument("--region", help="The AWS region.", default=AWS_REGION)
             "choices": list(AMIS),
         },
         "key_name": {
-            "help": "The SSH key name.",
+            "help": "The SSH key name. Will default to TOOLS_KEY_NAME in environment",
         },
         "instance_type": {
             "help": "The instance type to use.",
@@ -110,7 +110,7 @@ vm.add_argument("--region", help="The AWS region.", default=AWS_REGION)
 def create(
     ctx: Context,
     name: str,
-    key_name: str = os.environ.get("RUNNER_NAME"),  # type: ignore[assignment]
+    key_name: str = os.environ.get("RUNNER_NAME") or os.environ.get("TOOLS_KEY_NAME"),  # type: ignore[assignment]
     instance_type: str = None,
     no_delete: bool = False,
     no_destroy_on_failure: bool = False,
@@ -311,6 +311,7 @@ def test(
         "PRINT_TEST_PLAN_ONLY": "0",
         "SKIP_INITIAL_ONEDIR_FAILURES": "1",
         "SKIP_INITIAL_GH_ACTIONS_FAILURES": "1",
+        "COVERAGE_CONTEXT": name,
     }
     if "LANG" in os.environ:
         env["LANG"] = os.environ["LANG"]
@@ -566,7 +567,9 @@ def download_artifacts(ctx: Context, name: str):
 @vm.command(
     name="sync-cache",
     arguments={
-        "key_name": {"help": "The SSH key name."},
+        "key_name": {
+            "help": "The SSH key name. Will default to TOOLS_KEY_NAME in environment"
+        },
         "delete": {
             "help": "Delete the entries in the cache that don't align with ec2",
             "action": "store_true",
@@ -575,7 +578,7 @@ def download_artifacts(ctx: Context, name: str):
 )
 def sync_cache(
     ctx: Context,
-    key_name: str = os.environ.get("RUNNER_NAME"),  # type: ignore[assignment]
+    key_name: str = os.environ.get("RUNNER_NAME") or os.environ.get("TOOLS_KEY_NAME"),  # type: ignore[assignment]
     delete: bool = False,
 ):
     """
@@ -589,8 +592,20 @@ def sync_cache(
     cached_instances = {}
     if STATE_DIR.exists():
         for state_path in STATE_DIR.iterdir():
-            instance_id = (state_path / "instance-id").read_text()
-            cached_instances[instance_id] = state_path.name
+            try:
+                instance_id = (state_path / "instance-id").read_text()
+            except FileNotFoundError:
+                if not delete:
+                    log.info(
+                        f"Would remove {state_path.name} (No valid ID) from cache at {state_path}"
+                    )
+                else:
+                    shutil.rmtree(state_path)
+                    log.info(
+                        f"REMOVED {state_path.name} (No valid ID) from cache at {state_path}"
+                    )
+            else:
+                cached_instances[instance_id] = state_path.name
 
     # Find what instances we are missing in our cached states
     to_write = {}
@@ -626,7 +641,9 @@ def sync_cache(
 @vm.command(
     name="list",
     arguments={
-        "key_name": {"help": "The SSH key name."},
+        "key_name": {
+            "help": "The SSH key name. Will default to TOOLS_KEY_NAME in environment"
+        },
         "states": {
             "help": "The instance state to filter by.",
             "flags": ["-s", "-state"],
@@ -636,7 +653,7 @@ def sync_cache(
 )
 def list_vms(
     ctx: Context,
-    key_name: str = os.environ.get("RUNNER_NAME"),  # type: ignore[assignment]
+    key_name: str = os.environ.get("RUNNER_NAME") or os.environ.get("TOOLS_KEY_NAME"),  # type: ignore[assignment]
     states: set[str] = None,
 ):
     """
@@ -804,7 +821,12 @@ class VM:
 
     def write_ssh_config(self):
         if self.ssh_config_file.exists():
-            return
+            if (
+                f"Hostname {self.instance.private_ip_address}"
+                in self.ssh_config_file.read_text()
+            ):
+                # If what's on config matches, then we're good
+                return
         if os.environ.get("CI") is not None:
             forward_agent = "no"
         else:
@@ -1111,6 +1133,7 @@ class VM:
             proc = None
             checks = 0
             last_error = None
+            connection_refused_or_reset = False
             while ssh_connection_timeout_progress <= ssh_connection_timeout:
                 start = time.time()
                 if proc is None:
@@ -1150,6 +1173,11 @@ class VM:
                         break
                     proc.wait(timeout=3)
                     stderr = proc.stderr.read().strip()
+                    if connection_refused_or_reset is False and (
+                        "connection refused" in stderr.lower()
+                        or "connection reset" in stderr.lower()
+                    ):
+                        connection_refused_or_reset = True
                     if stderr:
                         stderr = f" Last Error: {stderr}"
                         last_error = stderr
@@ -1169,6 +1197,12 @@ class VM:
                     description=f"Waiting for SSH to become available at {host} ...{stderr or ''}",
                 )
 
+                if connection_refused_or_reset:
+                    # Since ssh is now running, and we're actually getting a connection
+                    # refused error message, let's try to ssh a little slower in order not
+                    # to get blocked
+                    time.sleep(10)
+
                 if checks >= 10 and proc is not None:
                     proc.kill()
                     proc = None
@@ -1187,7 +1221,7 @@ class VM:
             timeout = self.config.terminate_timeout
             timeout_progress = 0.0
             progress = create_progress_bar()
-            task = progress.add_task(f"Terminatting {self!r}...", total=timeout)
+            task = progress.add_task(f"Terminating {self!r}...", total=timeout)
             self.instance.terminate()
             try:
                 with progress:
