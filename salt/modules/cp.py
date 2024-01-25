@@ -15,11 +15,13 @@ import salt.fileclient
 import salt.minion
 import salt.utils.data
 import salt.utils.files
+import salt.utils.functools
 import salt.utils.gzip_util
 import salt.utils.path
 import salt.utils.templates
 import salt.utils.url
 from salt.exceptions import CommandExecutionError
+from salt.loader.dunder import __file_client__
 
 log = logging.getLogger(__name__)
 
@@ -147,7 +149,7 @@ def recv_chunked(dest, chunk, append=False, compressed=True, mode=None):
             log.debug("Setting mode for %s to %s", dest, mode)
             try:
                 os.chmod(dest, mode)
-            except OSError:
+            except OSError as exc:
                 return _error(exc.__str__())
         return True
     finally:
@@ -159,8 +161,13 @@ def recv_chunked(dest, chunk, append=False, compressed=True, mode=None):
 
 def _client():
     """
-    Return a client, hashed by the list of masters
+    Return a file client
+
+    If the __file_client__ context is set return it, otherwize create a new
+    file client using __opts__.
     """
+    if __file_client__:
+        return __file_client__.value()
     return salt.fileclient.get_file_client(__opts__)
 
 
@@ -176,7 +183,7 @@ def _render_filenames(path, dest, saltenv, template, **kw):
     # render the path as a template using path_template_engine as the engine
     if template not in salt.utils.templates.TEMPLATE_REGISTRY:
         raise CommandExecutionError(
-            "Attempted to render file paths with unavailable engine {}".format(template)
+            f"Attempted to render file paths with unavailable engine {template}"
         )
 
     kwargs = {}
@@ -559,6 +566,9 @@ def cache_file(path, saltenv=None, source_hash=None, verify_ssl=True, use_etag=F
     return result
 
 
+cache_file_ssh = salt.utils.functools.alias_function(cache_file, "cache_file_ssh")
+
+
 def cache_dest(url, saltenv=None):
     """
     .. versionadded:: 3000
@@ -727,7 +737,7 @@ def list_states(saltenv=None):
     .. versionchanged:: 3005
         ``saltenv`` will use value from config if not explicitly set
 
-    List all of the available state modules in an environment
+    List all of the available state files in an environment
 
     CLI Example:
 
@@ -866,6 +876,9 @@ def hash_file(path, saltenv=None):
 
     with _client() as client:
         return client.hash_file(path, saltenv)
+
+
+hash_file_ssh = salt.utils.functools.alias_function(hash_file, "hash_file_ssh")
 
 
 def stat_file(path, saltenv=None, octal=True):

@@ -3,33 +3,15 @@
       fail-fast: false
       matrix:
         include:
-        <%- for distro, version, arch in (
-                                            ("amazon", "2", "x86_64"),
-                                            ("amazon", "2", "aarch64"),
-                                            ("redhat", "7", "x86_64"),
-                                            ("redhat", "7", "aarch64"),
-                                            ("redhat", "8", "x86_64"),
-                                            ("redhat", "8", "aarch64"),
-                                            ("redhat", "9", "x86_64"),
-                                            ("redhat", "9", "aarch64"),
-                                            ("fedora", "36", "x86_64"),
-                                            ("fedora", "36", "aarch64"),
-                                            ("fedora", "37", "x86_64"),
-                                            ("fedora", "37", "aarch64"),
-                                            ("fedora", "38", "x86_64"),
-                                            ("fedora", "38", "aarch64"),
-                                            ("photon", "3", "x86_64"),
-                                            ("photon", "3", "aarch64"),
-                                            ("photon", "4", "x86_64"),
-                                            ("photon", "4", "aarch64"),
-                                        ) %>
-          - distro: <{ distro }>
+        <%- for distro, version, arch in build_rpms_listing %>
+          - pkg-type: rpm
+            distro: <{ distro }>
             version: "<{ version }>"
             arch: <{ arch }>
         <%- endfor %>
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Download System Dependencies
         run: |
@@ -38,6 +20,8 @@
 
       - name: Setup Python Tools Scripts
         uses: ./.github/actions/setup-python-tools-scripts
+        with:
+          cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
 
       - name: Get Salt Project GitHub Actions Bot Environment
         run: |
@@ -46,9 +30,9 @@
           echo "SPB_ENVIRONMENT=$SPB_ENVIRONMENT" >> "$GITHUB_ENV"
 
       - name: Download RPM Packages
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          name: salt-${{ needs.prepare-workflow.outputs.salt-version }}-${{ matrix.arch }}-rpm
+          name: salt-${{ needs.prepare-workflow.outputs.salt-version }}-${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }}-rpm
           path: artifacts/pkgs/incoming
 
       - name: Setup GnuPG

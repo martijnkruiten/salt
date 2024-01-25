@@ -3,23 +3,15 @@
       fail-fast: false
       matrix:
         include:
-        <%- for distro, version, arch in (
-                                            ("debian", "10", "x86_64"),
-                                            ("debian", "10", "aarch64"),
-                                            ("debian", "11", "x86_64"),
-                                            ("debian", "11", "aarch64"),
-                                            ("ubuntu", "20.04", "x86_64"),
-                                            ("ubuntu", "20.04", "aarch64"),
-                                            ("ubuntu", "22.04", "x86_64"),
-                                            ("ubuntu", "22.04", "aarch64"),
-                                        ) %>
-          - distro: <{ distro }>
+        <%- for distro, version, arch in build_debs_listing %>
+          - pkg-type: deb
+            distro: <{ distro }>
             version: "<{ version }>"
             arch: <{ arch }>
         <%- endfor %>
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Download System Dependencies
         run: |
@@ -28,6 +20,8 @@
 
       - name: Setup Python Tools Scripts
         uses: ./.github/actions/setup-python-tools-scripts
+        with:
+          cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
 
       - name: Get Salt Project GitHub Actions Bot Environment
         run: |
@@ -36,7 +30,7 @@
           echo "SPB_ENVIRONMENT=$SPB_ENVIRONMENT" >> "$GITHUB_ENV"
 
       - name: Download DEB Packages
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: salt-${{ needs.prepare-workflow.outputs.salt-version }}-${{ matrix.arch }}-deb
           path: artifacts/pkgs/incoming

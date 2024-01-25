@@ -10,11 +10,11 @@ import logging
 import os
 import pathlib
 import shutil
-import sys
 import textwrap
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+import boto3
 from ptscripts import Context, command_group
 
 import tools.pkg
@@ -25,17 +25,6 @@ from tools.utils.repo import (
     create_top_level_repo_path,
     get_repo_json_file_contents,
 )
-
-try:
-    import boto3
-except ImportError:
-    print(
-        "\nPlease run 'python -m pip install -r "
-        "requirements/static/ci/py{}.{}/tools.txt'\n".format(*sys.version_info),
-        file=sys.stderr,
-        flush=True,
-    )
-    raise
 
 log = logging.getLogger(__name__)
 
@@ -51,11 +40,16 @@ _deb_distro_info = {
         "10": {
             "label": "deb10ary",
             "codename": "buster",
-            "suitename": "oldstable",
+            "suitename": "oldoldstable",
         },
         "11": {
             "label": "deb11ary",
             "codename": "bullseye",
+            "suitename": "oldstable",
+        },
+        "12": {
+            "label": "deb12ary",
+            "codename": "bookworm",
             "suitename": "stable",
         },
     },
@@ -152,7 +146,7 @@ def debian(
     distro_details = _deb_distro_info[distro][distro_version]
 
     ctx.info("Distribution Details:")
-    ctx.info(distro_details)
+    ctx.print(distro_details, soft_wrap=True)
     if TYPE_CHECKING:
         assert isinstance(distro_details["label"], str)
         assert isinstance(distro_details["codename"], str)
@@ -315,10 +309,10 @@ def debian(
 
 
 _rpm_distro_info = {
-    "amazon": ["2"],
+    "amazon": ["2", "2023"],
     "redhat": ["7", "8", "9"],
     "fedora": ["36", "37", "38"],
-    "photon": ["3", "4"],
+    "photon": ["3", "4", "5"],
 }
 
 
@@ -386,14 +380,14 @@ def rpm(
         assert incoming is not None
         assert repo_path is not None
         assert key_id is not None
+
     display_name = f"{distro.capitalize()} {distro_version}"
     if distro_version not in _rpm_distro_info[distro]:
         ctx.error(f"Support for {display_name} is missing.")
         ctx.exit(1)
 
-    if distro_arch == "aarch64":
-        ctx.info(f"The {distro_arch} arch is an alias for 'arm64'. Adjusting.")
-        distro_arch = "arm64"
+    if distro == "photon":
+        distro_version = f"{distro_version}.0"
 
     ctx.info("Creating repository directory structure ...")
     create_repo_path = create_top_level_repo_path(
@@ -900,6 +894,8 @@ def _create_onedir_based_repo(
             arch = "x86"
         elif "-aarch64" in dpath.name.lower():
             arch = "aarch64"
+        elif "-arm64" in dpath.name.lower():
+            arch = "arm64"
         else:
             ctx.error(
                 f"Cannot pickup the right architecture from the filename '{dpath.name}'."
@@ -908,7 +904,7 @@ def _create_onedir_based_repo(
         if distro == "onedir":
             if "-onedir-linux-" in dpath.name.lower():
                 release_os = "linux"
-            elif "-onedir-darwin-" in dpath.name.lower():
+            elif "-onedir-macos-" in dpath.name.lower():
                 release_os = "macos"
             elif "-onedir-windows-" in dpath.name.lower():
                 release_os = "windows"

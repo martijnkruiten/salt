@@ -11,9 +11,11 @@ import hashlib
 import logging
 import multiprocessing
 import os
+import pathlib
 import queue
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -462,12 +464,15 @@ class SSH(MultiprocessingStateMixin):
         """
         Deploy the SSH key if the minions don't auth
         """
+        # `or` initially was `and`, but was changed to be able to "deploy
+        # to multiple hosts" in #22661. Why? On each command error, this checks
+        # if a key deploy can be attempted without it being requested.
         if not isinstance(ret[host], dict) or self.opts.get("ssh_key_deploy"):
             target = self.targets[host]
             if target.get("passwd", False) or self.opts["ssh_passwd"]:
                 self._key_deploy_run(host, target, False)
-            return ret
-        if ret[host].get("stderr", "").count("Permission denied"):
+            return ret, None
+        if "_error" in ret[host] and ret[host]["_error"] == "Permission denied":
             target = self.targets[host]
             # permission denied, attempt to auto deploy ssh key
             print(
@@ -481,7 +486,7 @@ class SSH(MultiprocessingStateMixin):
                 "Password for {}@{}: ".format(target["user"], host)
             )
             return self._key_deploy_run(host, target, True)
-        return ret
+        return ret, None
 
     def _key_deploy_run(self, host, target, re_run=True):
         """
@@ -520,15 +525,46 @@ class SSH(MultiprocessingStateMixin):
             )
             stdout, stderr, retcode = single.cmd_block()
             try:
-                data = salt.utils.json.find_json(stdout)
-                return {host: data.get("local", data)}
-            except Exception:  # pylint: disable=broad-except
-                if stderr:
-                    return {host: stderr}
-                return {host: "Bad Return"}
-        if salt.defaults.exitcodes.EX_OK != retcode:
-            return {host: stderr}
-        return {host: stdout}
+                retcode = int(retcode)
+            except (TypeError, ValueError):
+                log.warning(f"Got an invalid retcode for host '{host}': '{retcode}'")
+                retcode = 1
+            try:
+                ret = (
+                    salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode),
+                    salt.defaults.exitcodes.EX_OK,
+                )
+            except (
+                salt.client.ssh.wrapper.SSHPermissionDeniedError,
+                salt.client.ssh.wrapper.SSHCommandExecutionError,
+            ) as err:
+                ret = err.to_ret()
+                retcode = max(retcode, err.retcode, 1)
+            except salt.client.ssh.wrapper.SSHException as err:
+                ret = err.to_ret()
+                if not self.opts.get("raw_shell"):
+                    # We only expect valid JSON output from Salt
+                    retcode = max(retcode, err.retcode, 1)
+                else:
+                    ret.pop("_error", None)
+            except Exception as err:  # pylint: disable=broad-except
+                log.error(
+                    f"Error while parsing the command output: {err}",
+                    exc_info_on_loglevel=logging.DEBUG,
+                )
+                ret = {
+                    "_error": f"Internal error while parsing the command output: {err}",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "retcode": retcode,
+                    "data": None,
+                }
+                retcode = max(retcode, 1)
+            return {host: ret}, retcode
+
+        if retcode != salt.defaults.exitcodes.EX_OK:
+            return {host: stderr}, retcode
+        return {host: stdout}, retcode
 
     def handle_routine(self, que, opts, host, target, mine=False):
         """
@@ -546,29 +582,43 @@ class SSH(MultiprocessingStateMixin):
             **target,
         )
         ret = {"id": single.id}
-        stdout, stderr, retcode = single.run()
-        # This job is done, yield
+        stdout = stderr = ""
+        retcode = salt.defaults.exitcodes.EX_OK
         try:
-            data = salt.utils.json.find_json(stdout)
-            if len(data) < 2 and "local" in data:
-                ret["ret"] = data["local"]
-                try:
-                    # Ensure a reported local retcode is kept
-                    retcode = data["local"]["retcode"]
-                except (KeyError, TypeError):
-                    pass
+            stdout, stderr, retcode = single.run()
+            try:
+                retcode = int(retcode)
+            except (TypeError, ValueError):
+                log.warning(f"Got an invalid retcode for host '{host}': '{retcode}'")
+                retcode = 1
+            ret["ret"] = salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode)
+        except (
+            salt.client.ssh.wrapper.SSHPermissionDeniedError,
+            salt.client.ssh.wrapper.SSHCommandExecutionError,
+        ) as err:
+            ret["ret"] = err.to_ret()
+            # All caught errors always indicate the retcode is/should be > 0
+            retcode = max(retcode, err.retcode, 1)
+        except salt.client.ssh.wrapper.SSHException as err:
+            ret["ret"] = err.to_ret()
+            if not self.opts.get("raw_shell"):
+                # We only expect valid JSON output from Salt
+                retcode = max(retcode, err.retcode, 1)
             else:
-                ret["ret"] = {
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "retcode": retcode,
-                }
-        except Exception:  # pylint: disable=broad-except
+                ret["ret"].pop("_error", None)
+        except Exception as err:  # pylint: disable=broad-except
+            log.error(
+                f"Error while parsing the command output: {err}",
+                exc_info_on_loglevel=logging.DEBUG,
+            )
             ret["ret"] = {
+                "_error": f"Internal error while parsing the command output: {err}",
                 "stdout": stdout,
                 "stderr": stderr,
                 "retcode": retcode,
+                "data": None,
             }
+            retcode = max(retcode, 1)
         que.put((ret, retcode))
 
     def handle_ssh(self, mine=False):
@@ -627,7 +677,7 @@ class SSH(MultiprocessingStateMixin):
                 running[host] = {"thread": routine}
                 continue
             ret = {}
-            retcode = 0
+            retcode = salt.defaults.exitcodes.EX_OK
             try:
                 ret, retcode = que.get(False)
                 if "id" in ret:
@@ -711,17 +761,28 @@ class SSH(MultiprocessingStateMixin):
                 jid, job_load
             )
 
-        for ret, _ in self.handle_ssh(mine=mine):
+        for ret, retcode in self.handle_ssh(mine=mine):
             host = next(iter(ret))
             self.cache_job(jid, host, ret[host], fun)
             if self.event:
                 id_, data = next(iter(ret.items()))
-                if isinstance(data, str):
+                if not isinstance(data, dict):
                     data = {"return": data}
                 if "id" not in data:
                     data["id"] = id_
                 if "fun" not in data:
                     data["fun"] = fun
+                if "fun_args" not in data:
+                    data["fun_args"] = args
+                if "retcode" not in data:
+                    data["retcode"] = retcode
+                if "success" not in data:
+                    data["success"] = data["retcode"] == salt.defaults.exitcodes.EX_OK
+                if "return" not in data:
+                    if data["success"]:
+                        data["return"] = data.get("stdout")
+                    else:
+                        data["return"] = data.get("stderr", data.get("stdout"))
                 data[
                     "jid"
                 ] = jid  # make the jid in the payload the same as the jid in the tag
@@ -804,13 +865,25 @@ class SSH(MultiprocessingStateMixin):
             print("")
         sret = {}
         outputter = self.opts.get("output", "nested")
-        final_exit = 0
+        final_exit = salt.defaults.exitcodes.EX_OK
         for ret, retcode in self.handle_ssh():
             host = next(iter(ret))
+            if not isinstance(retcode, int):
+                log.warning(f"Host '{host}' returned an invalid retcode: {retcode}")
+                retcode = 1
             final_exit = max(final_exit, retcode)
 
             self.cache_job(jid, host, ret[host], fun)
-            ret = self.key_deploy(host, ret)
+            ret, deploy_retcode = self.key_deploy(host, ret)
+            if deploy_retcode is not None:
+                try:
+                    retcode = int(deploy_retcode)
+                except (TypeError, ValueError):
+                    log.warning(
+                        f"Got an invalid deploy retcode for host '{host}': '{retcode}'"
+                    )
+                    retcode = 1
+            final_exit = max(final_exit, retcode)
 
             if isinstance(ret[host], dict) and (
                 ret[host].get("stderr") or ""
@@ -820,7 +893,10 @@ class SSH(MultiprocessingStateMixin):
             if not isinstance(ret[host], dict):
                 p_data = {host: ret[host]}
             elif "return" not in ret[host]:
-                p_data = ret
+                if ret[host].get("_error") == "Permission denied":
+                    p_data = {host: ret[host]["stderr"]}
+                else:
+                    p_data = ret
             else:
                 outputter = ret[host].get("out", self.opts.get("output", "nested"))
                 p_data = {host: ret[host].get("return", {})}
@@ -830,12 +906,23 @@ class SSH(MultiprocessingStateMixin):
                 salt.output.display_output(p_data, outputter, self.opts)
             if self.event:
                 id_, data = next(iter(ret.items()))
-                if isinstance(data, str):
+                if not isinstance(data, dict):
                     data = {"return": data}
                 if "id" not in data:
                     data["id"] = id_
                 if "fun" not in data:
                     data["fun"] = fun
+                if "fun_args" not in data:
+                    data["fun_args"] = args
+                if "retcode" not in data:
+                    data["retcode"] = retcode
+                if "success" not in data:
+                    data["success"] = data["retcode"] == salt.defaults.exitcodes.EX_OK
+                if "return" not in data:
+                    if data["success"]:
+                        data["return"] = data.get("stdout")
+                    else:
+                        data["return"] = data.get("stderr", data.get("stdout"))
                 data[
                     "jid"
                 ] = jid  # make the jid in the payload the same as the jid in the tag
@@ -1007,11 +1094,30 @@ class Single:
         """
         Run our pre_flight script before running any ssh commands
         """
-        script = os.path.join(tempfile.gettempdir(), self.ssh_pre_file)
+        with tempfile.NamedTemporaryFile() as temp:
+            # ensure we use copyfile to not copy the file attributes
+            # we want to ensure we use the perms set by the secure
+            # NamedTemporaryFile
+            try:
+                shutil.copyfile(self.ssh_pre_flight, temp.name)
+            except OSError:
+                return (
+                    "",
+                    "Could not copy pre flight script to temporary path",
+                    1,
+                )
+            target_script = f".{pathlib.Path(temp.name).name}"
+            log.trace("Copying the pre flight script to target")
+            stdout, stderr, retcode = self.shell.send(temp.name, target_script)
+            if retcode != 0:
+                # We could not copy the script to the target
+                log.error("Could not copy the pre flight script to target")
+                return stdout, stderr, retcode
 
-        self.shell.send(self.ssh_pre_flight, script)
-
-        return self.execute_script(script, script_args=self.ssh_pre_flight_args)
+            log.trace("Executing the pre flight script on target")
+            return self.execute_script(
+                target_script, script_args=self.ssh_pre_flight_args
+            )
 
     def check_thin_dir(self):
         """
@@ -1056,7 +1162,8 @@ class Single:
 
         Returns tuple of (stdout, stderr, retcode)
         """
-        stdout = stderr = retcode = None
+        stdout = stderr = ""
+        retcode = salt.defaults.exitcodes.EX_OK
 
         if self.ssh_pre_flight:
             if not self.opts.get("ssh_run_pre_flight", False) and self.check_thin_dir():
@@ -1070,7 +1177,7 @@ class Single:
                 )
             else:
                 stdout, stderr, retcode = self.run_ssh_pre_flight()
-                if retcode != 0:
+                if retcode != salt.defaults.exitcodes.EX_OK:
                     log.error(
                         "Error running ssh_pre_flight script %s", self.ssh_pre_file
                     )
@@ -1133,11 +1240,6 @@ class Single:
             )
 
             opts_pkg = pre_wrapper["test.opts_pkg"]()  # pylint: disable=E1102
-            if "_error" in opts_pkg:
-                # Refresh failed
-                retcode = opts_pkg["retcode"]
-                ret = salt.utils.json.dumps({"local": opts_pkg})
-                return ret, retcode
 
             opts_pkg["file_roots"] = self.opts["file_roots"]
             opts_pkg["pillar_roots"] = self.opts["pillar_roots"]
@@ -1158,7 +1260,7 @@ class Single:
             # Use the ID defined in the roster file
             opts_pkg["id"] = self.id
 
-            retcode = 0
+            retcode = salt.defaults.exitcodes.EX_OK
 
             # Restore master grains
             for grain in conf_grains:
@@ -1168,9 +1270,11 @@ class Single:
                 for grain in self.target["grains"]:
                     opts_pkg["grains"][grain] = self.target["grains"][grain]
 
+            # Pillar compilation needs the master opts primarily,
+            # same as during regular operation.
             popts = {}
-            popts.update(opts_pkg["__master_opts__"])
             popts.update(opts_pkg)
+            popts.update(opts_pkg["__master_opts__"])
             pillar = salt.pillar.Pillar(
                 popts,
                 opts_pkg["grains"],
@@ -1262,24 +1366,40 @@ class Single:
                 result = wrapper[mine_fun](*self.args, **self.kwargs)
             else:
                 result = self.wfuncs[self.fun](*self.args, **self.kwargs)
+        except salt.client.ssh.wrapper.SSHException:
+            # SSHExceptions indicating remote command failure or
+            # parsing issues are handled centrally in SSH.handle_routine
+            raise
         except TypeError as exc:
-            result = f"TypeError encountered executing {self.fun}: {exc}"
+            result = {"local": f"TypeError encountered executing {self.fun}: {exc}"}
             log.error(result, exc_info_on_loglevel=logging.DEBUG)
             retcode = 1
         except Exception as exc:  # pylint: disable=broad-except
-            result = "An Exception occurred while executing {}: {}".format(
-                self.fun, exc
-            )
+            result = {
+                "local": f"An Exception occurred while executing {self.fun}: {exc}"
+            }
             log.error(result, exc_info_on_loglevel=logging.DEBUG)
             retcode = 1
 
-        # Ensure retcode from wrappers is respected, especially state render exceptions
-        retcode = max(retcode, self.context.get("retcode", 0))
+        try:
+            # Ensure retcode from wrappers is respected, especially state render exceptions
+            retcode = max(
+                retcode, self.context.get("retcode", salt.defaults.exitcodes.EX_OK)
+            )
+        except (TypeError, ValueError):
+            log.warning(
+                f"Wrapper module set invalid value for retcode: '{self.context['retcode']}"
+            )
+            retcode = max(retcode, 1)
 
         # Mimic the json data-structure that "salt-call --local" will
         # emit (as seen in ssh_py_shim.py)
         if isinstance(result, dict) and "local" in result:
             ret = salt.utils.json.dumps({"local": result["local"]})
+        elif self.context.get("retcode"):
+            # The wrapped command failed, the usual behavior is that
+            # the return is dumped as-is without declaring it as a result.
+            ret = salt.utils.json.dumps({"local": result})
         else:
             ret = salt.utils.json.dumps({"local": {"return": result}})
         return ret, retcode
@@ -1388,18 +1508,20 @@ ARGS = {arguments}\n'''.format(
             return self.shell.exec_cmd(cmd_str)
 
         # Write the shim to a temporary file in the default temp directory
-        with tempfile.NamedTemporaryFile(
-            mode="w+b", prefix="shim_", delete=False
-        ) as shim_tmp_file:
+        with tempfile.NamedTemporaryFile(mode="w+b", delete=False) as shim_tmp_file:
             shim_tmp_file.write(salt.utils.stringutils.to_bytes(cmd_str))
 
         # Copy shim to target system, under $HOME/.<randomized name>
-        target_shim_file = ".{}.{}".format(
-            binascii.hexlify(os.urandom(6)).decode("ascii"), extension
-        )
+        target_shim_file = f".{pathlib.Path(shim_tmp_file.name).name}"
+
         if self.winrm:
             target_shim_file = saltwinshell.get_target_shim_file(self, target_shim_file)
-        self.shell.send(shim_tmp_file.name, target_shim_file, makedirs=True)
+        stdout, stderr, retcode = self.shell.send(
+            shim_tmp_file.name, target_shim_file, makedirs=self.winrm
+        )
+        if retcode != 0:
+            log.error("Could not copy the shim script to target")
+            return stdout, stderr, retcode
 
         # Remove our shim file
         try:
@@ -1629,7 +1751,7 @@ ARGS = {arguments}\n'''.format(
         return
 
 
-def lowstate_file_refs(chunks):
+def lowstate_file_refs(chunks):  # pragma: no cover
     """
     Create a list of file ref objects to reconcile
     """
@@ -1680,6 +1802,7 @@ def mod_data(fsclient):
         "grains",
         "renderers",
         "returners",
+        "utils",
     ]
     ret = {}
     with fsclient:

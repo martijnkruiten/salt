@@ -478,13 +478,12 @@ class AsyncPubChannel:
         if callback is None:
             return self.transport.on_recv(None)
 
-        @tornado.gen.coroutine
-        def wrap_callback(messages):
+        async def wrap_callback(messages):
             payload = self.transport._decode_messages(messages)
-            decoded = yield self._decode_payload(payload)
-            log.debug("PubChannel received: %r", decoded)
-            if decoded is not None:
-                callback(decoded)
+            decoded = await self._decode_payload(payload)
+            log.debug("PubChannel received: %r %r", decoded, callback)
+            if decoded is not None and callback is not None:
+                await callback(decoded)
 
         return self.transport.on_recv(wrap_callback)
 
@@ -564,19 +563,16 @@ class AsyncPubChannel:
                     "data": data,
                     "tag": tag,
                 }
-                req_channel = AsyncReqChannel.factory(self.opts)
-                try:
-                    yield req_channel.send(load, timeout=60)
-                except salt.exceptions.SaltReqTimeoutError:
-                    log.info(
-                        "fire_master failed: master could not be contacted. Request timed"
-                        " out."
-                    )
-                except Exception:  # pylint: disable=broad-except
-                    log.info("fire_master failed", exc_info=True)
-                finally:
-                    # SyncWrapper will call either close() or destroy(), whichever is available
-                    del req_channel
+                with AsyncReqChannel.factory(self.opts) as channel:
+                    try:
+                        yield channel.send(load, timeout=60)
+                    except salt.exceptions.SaltReqTimeoutError:
+                        log.info(
+                            "fire_master failed: master could not be contacted. Request timed"
+                            " out."
+                        )
+                    except Exception:  # pylint: disable=broad-except
+                        log.info("fire_master failed", exc_info=True)
             else:
                 self._reconnected = True
         except Exception as exc:  # pylint: disable=broad-except

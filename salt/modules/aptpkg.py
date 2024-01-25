@@ -47,7 +47,6 @@ from salt.exceptions import (
     SaltInvocationError,
 )
 from salt.modules.cmdmod import _parse_env
-from salt.utils.versions import warn_until_date
 
 log = logging.getLogger(__name__)
 
@@ -203,16 +202,27 @@ if not HAS_APT:
                 repo_line.append("#")
 
             repo_line.append(self.type)
-            opts = []
+            opts = _get_opts(self.line)
             if self.architectures:
-                opts.append("arch={}".format(",".join(self.architectures)))
+                archs = ",".join(self.architectures)
+                opts["arch"]["full"] = f"arch={archs}"
+                opts["arch"]["value"] = self.architectures
             if self.signedby:
-                opts.append(f"signed-by={self.signedby}")
+                opts["signedby"]["full"] = f"signed-by={self.signedby}"
+                opts["signedby"]["value"] = self.signedby
 
-            if opts:
-                repo_line.append("[{}]".format(" ".join(opts)))
+            ordered_opts = [
+                opt_type for opt_type, opt in opts.items() if opt["full"] != ""
+            ]
 
-            repo_line = repo_line + [self.uri, self.dist, " ".join(self.comps)]
+            for opt in opts.values():
+                if opt["full"] != "":
+                    ordered_opts[opt["index"]] = opt["full"]
+
+            if ordered_opts:
+                repo_line.append("[{}]".format(" ".join(ordered_opts)))
+
+            repo_line += [self.uri, self.dist, " ".join(self.comps)]
             if self.comment:
                 repo_line.append(f"#{self.comment}")
             return " ".join(repo_line) + "\n"
@@ -1057,9 +1067,9 @@ def _uninstall(action="remove", name=None, pkgs=None, **kwargs):
 
     old = list_pkgs()
     old_removed = list_pkgs(removed=True)
-    targets = [x for x in pkg_params if x in old]
+    targets = salt.utils.pkg.match_wildcard(old, pkg_params)
     if action == "purge":
-        targets.extend([x for x in pkg_params if x in old_removed])
+        targets.update(salt.utils.pkg.match_wildcard(old_removed, pkg_params))
     if not targets:
         return {}
     cmd = ["apt-get", "-q", "-y", action]
@@ -2924,6 +2934,7 @@ def mod_repo(repo, saltenv="base", aptkey=True, **kwargs):
     if "comments" in kwargs:
         kwargs["comments"] = salt.utils.pkg.deb.combine_comments(kwargs["comments"])
 
+    repo_source_entry = SourceEntry(repo)
     if not mod_source:
         mod_source = SourceEntry(repo)
         if "comments" in kwargs:
@@ -2932,12 +2943,7 @@ def mod_repo(repo, saltenv="base", aptkey=True, **kwargs):
     elif "comments" in kwargs:
         mod_source.comment = kwargs["comments"]
 
-    if HAS_APT:
-        # workaround until python3-apt supports signedby
-        if str(mod_source) != str(SourceEntry(repo)) and "signed-by" in str(mod_source):
-            rline = SourceEntry(repo)
-            mod_source.line = rline.line
-
+    mod_source.line = repo_source_entry.line
     if not mod_source.line.endswith("\n"):
         mod_source.line = mod_source.line + "\n"
 
@@ -3107,39 +3113,6 @@ def _expand_repo_def(os_name, os_codename=None, **kwargs):
             sanitized["line"] = " ".join(line)
 
     return sanitized
-
-
-def expand_repo_def(**kwargs):
-    """
-    Take a repository definition and expand it to the full pkg repository dict
-    that can be used for comparison.  This is a helper function to make
-    the Debian/Ubuntu apt sources sane for comparison in the pkgrepo states.
-
-    This is designed to be called from pkgrepo states and will have little use
-    being called on the CLI.
-
-    CLI Examples:
-
-    .. code-block:: bash
-
-        NOT USABLE IN THE CLI
-    """
-    warn_until_date(
-        "20240101",
-        "The pkg.expand_repo_def function is deprecated and set for removal "
-        "after {date}. This is only unsed internally by the apt pkg state "
-        "module. If that's not the case, please file an new issue requesting "
-        "the removal of this deprecation warning",
-        stacklevel=3,
-    )
-    if "os_name" not in kwargs:
-        kwargs["os_name"] = __grains__["os"]
-    if "os_codename" not in kwargs:
-        if "lsb_distrib_codename" in kwargs:
-            kwargs["os_codename"] = kwargs["lsb_distrib_codename"]
-        else:
-            kwargs["os_codename"] = __grains__.get("oscodename")
-    return _expand_repo_def(**kwargs)
 
 
 def _parse_selections(dpkgselection):

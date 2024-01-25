@@ -6,7 +6,6 @@
 <%- set gh_environment = "staging" %>
 <%- set prepare_actual_release = True %>
 <%- set skip_test_coverage_check = "true" %>
-<%- set skip_junit_reports_check = "true" %>
 <%- extends 'nightly.yml.jinja' %>
 
 <%- block name %>
@@ -66,7 +65,7 @@ concurrency:
   <{ job_name }>:
   <%- do prepare_workflow_needs.append(job_name) %>
     name: Check Requirements
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "linux", "x86_64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     environment: <{ gh_environment }>-check
     steps:
       - name: Check For Admin Permission
@@ -94,7 +93,7 @@ concurrency:
       - linux
       - repo-<{ gh_environment }>
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Get Salt Project GitHub Actions Bot Environment
         run: |
@@ -104,27 +103,29 @@ concurrency:
 
       - name: Setup Python Tools Scripts
         uses: ./.github/actions/setup-python-tools-scripts
+        with:
+          cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
 
       - name: Download Release Patch
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: salt-${{ needs.prepare-workflow.outputs.salt-version }}.patch
           path: artifacts/release
 
       - name: Download Source Repository
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: salt-${{ needs.prepare-workflow.outputs.salt-version }}-<{ gh_environment }>-src-repo
           path: artifacts/release
 
       - name: Download Release Documentation (HTML)
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: salt-${{ needs.prepare-workflow.outputs.salt-version }}-docs-html.tar.xz
           path: artifacts/release
 
       - name: Download Release Documentation (ePub)
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: Salt-${{ needs.prepare-workflow.outputs.salt-version }}.epub
           path: artifacts/release
@@ -136,7 +137,7 @@ concurrency:
       {#-
 
       - name: Download Release Documentation (PDF)
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: Salt-${{ needs.prepare-workflow.outputs.salt-version }}.pdf
           path: artifacts/release
@@ -148,7 +149,7 @@ concurrency:
           tools release upload-artifacts ${{ needs.prepare-workflow.outputs.salt-version }} artifacts/release
 
       - name: Upload PyPi Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: pypi-artifacts
           path: |
@@ -158,7 +159,7 @@ concurrency:
           if-no-files-found: error
 
   <%- if includes.get("test-pkg-downloads", True) %>
-  <%- include "test-pkg-repo-downloads.yml.jinja" %>
+  <%- include "test-salt-pkg-repo-downloads.yml.jinja" %>
   <%- endif %>
 
   publish-pypi:
@@ -183,10 +184,12 @@ concurrency:
       - linux
       - repo-<{ gh_environment }>
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Setup Python Tools Scripts
         uses: ./.github/actions/setup-python-tools-scripts
+        with:
+          cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
 
       - name: Setup GnuPG
         run: |
@@ -213,7 +216,7 @@ concurrency:
           echo "twine-password=$TWINE_PASSWORD" >> "${GITHUB_OUTPUT}"
 
       - name: Download PyPi Artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: pypi-artifacts
           path: artifacts/release

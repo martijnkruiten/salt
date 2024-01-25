@@ -8,27 +8,16 @@ import json
 import logging
 import os
 import pathlib
-import sys
 import tempfile
 import time
 
+import boto3
 import virustotal3.core
+from botocore.exceptions import ClientError
 from ptscripts import Context, command_group
 
 import tools.utils
 import tools.utils.repo
-
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-except ImportError:
-    print(
-        "\nPlease run 'python -m pip install -r "
-        "requirements/static/ci/py{}.{}/tools.txt'\n".format(*sys.version_info),
-        file=sys.stderr,
-        flush=True,
-    )
-    raise
 
 log = logging.getLogger(__name__)
 
@@ -144,13 +133,13 @@ def download_onedir_artifact(
     Download onedir artifact from staging bucket.
     """
     s3 = boto3.client("s3")
-    if platform == "macos":
-        platform = "darwin"
+    if platform == "darwin":
+        platform = "macos"
     if arch == "arm64":
         arch = "aarch64"
     arch = arch.lower()
     platform = platform.lower()
-    if platform in ("linux", "darwin") and arch not in ("x86_64", "aarch64"):
+    if platform in ("linux", "macos") and arch not in ("x86_64", "aarch64"):
         ctx.error(
             f"The 'arch' value for {platform} must be one of: 'x86_64', 'aarch64', 'arm64'"
         )

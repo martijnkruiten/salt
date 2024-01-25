@@ -28,14 +28,16 @@ __func_alias__ = {"apply_": "apply"}
 log = logging.getLogger(__name__)
 
 
-def _ssh_state(chunks, st_kwargs, kwargs, test=False):
+def _ssh_state(chunks, st_kwargs, kwargs, pillar, test=False):
     """
     Function to run a state with the given chunk via salt-ssh
     """
     file_refs = salt.client.ssh.state.lowstate_file_refs(
         chunks,
         _merge_extra_filerefs(
-            kwargs.get("extra_filerefs", ""), __opts__.get("extra_filerefs", "")
+            kwargs.get("extra_filerefs", ""),
+            __opts__.get("extra_filerefs", ""),
+            __context__.get("_cp_extra_filerefs", ""),
         ),
     )
     # Create the tar containing the state pkg and relevant files.
@@ -43,7 +45,7 @@ def _ssh_state(chunks, st_kwargs, kwargs, test=False):
         __context__["fileclient"],
         chunks,
         file_refs,
-        __pillar__.value(),
+        pillar,
         st_kwargs["id_"],
     )
     trans_tar_sum = salt.utils.hashutils.get_hash(trans_tar, __opts__["hash_type"])
@@ -58,7 +60,7 @@ def _ssh_state(chunks, st_kwargs, kwargs, test=False):
         **st_kwargs,
     )
     single.shell.send(trans_tar, "{}/salt_state.tgz".format(__opts__["thin_dir"]))
-    stdout, stderr, _ = single.cmd_block()
+    stdout, stderr, retcode = single.cmd_block()
 
     # Clean up our tar
     try:
@@ -66,33 +68,7 @@ def _ssh_state(chunks, st_kwargs, kwargs, test=False):
     except OSError:
         pass
 
-    # Read in the JSON data and return the data structure
-    try:
-        return salt.utils.data.decode(
-            salt.utils.json.loads(stdout, object_hook=salt.utils.data.encode_dict)
-        )
-    except Exception as e:  # pylint: disable=broad-except
-        log.error("JSON Render failed for: %s\n%s", stdout, stderr)
-        log.error(str(e))
-
-    # If for some reason the json load fails, return the stdout
-    return salt.utils.data.decode(stdout)
-
-
-def _set_retcode(ret, highstate=None):
-    """
-    Set the return code based on the data back from the state system
-    """
-
-    # Set default retcode to 0
-    __context__["retcode"] = salt.defaults.exitcodes.EX_OK
-
-    if isinstance(ret, list):
-        __context__["retcode"] = salt.defaults.exitcodes.EX_STATE_COMPILER_ERROR
-        return
-    if not salt.utils.state.check_result(ret, highstate=highstate):
-
-        __context__["retcode"] = salt.defaults.exitcodes.EX_STATE_FAILURE
+    return {"local": salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode)}
 
 
 def _check_pillar(kwargs, pillar=None):
@@ -173,21 +149,30 @@ def sls(mods, saltenv="base", test=None, exclude=None, **kwargs):
     """
     st_kwargs = __salt__.kwargs
     __opts__["grains"] = __grains__.value()
-    __pillar__.update(kwargs.get("pillar", {}))
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
     opts["test"] = _get_test_value(test, **kwargs)
+    initial_pillar = _get_initial_pillar(opts)
+    pillar_override = kwargs.get("pillar")
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        pillar_override,
         __salt__.value(),
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=initial_pillar,
     ) as st_:
         if not _check_pillar(kwargs, st_.opts["pillar"]):
             __context__["retcode"] = salt.defaults.exitcodes.EX_PILLAR_FAILURE
             err = ["Pillar failed to render with the following messages:"]
             err += st_.opts["pillar"]["_errors"]
             return err
+        try:
+            pillar = st_.opts["pillar"].value()
+        except AttributeError:
+            pillar = st_.opts["pillar"]
+        if pillar_override is not None or initial_pillar is None:
+            # Ensure other wrappers use the correct pillar
+            __pillar__.update(pillar)
         st_.push_active()
         mods = _parse_mods(mods)
         high_data, errors = st_.render_highstate(
@@ -218,7 +203,9 @@ def sls(mods, saltenv="base", test=None, exclude=None, **kwargs):
         file_refs = salt.client.ssh.state.lowstate_file_refs(
             chunks,
             _merge_extra_filerefs(
-                kwargs.get("extra_filerefs", ""), opts.get("extra_filerefs", "")
+                kwargs.get("extra_filerefs", ""),
+                opts.get("extra_filerefs", ""),
+                __context__.get("_cp_extra_filerefs", ""),
             ),
         )
 
@@ -231,7 +218,7 @@ def sls(mods, saltenv="base", test=None, exclude=None, **kwargs):
             __context__["fileclient"],
             chunks,
             file_refs,
-            __pillar__.value(),
+            pillar,
             st_kwargs["id_"],
             roster_grains,
         )
@@ -247,7 +234,7 @@ def sls(mods, saltenv="base", test=None, exclude=None, **kwargs):
             **st_kwargs,
         )
         single.shell.send(trans_tar, "{}/salt_state.tgz".format(opts["thin_dir"]))
-        stdout, stderr, _ = single.cmd_block()
+        stdout, stderr, retcode = single.cmd_block()
 
         # Clean up our tar
         try:
@@ -255,15 +242,7 @@ def sls(mods, saltenv="base", test=None, exclude=None, **kwargs):
         except OSError:
             pass
 
-        # Read in the JSON data and return the data structure
-        try:
-            return salt.utils.json.loads(stdout)
-        except Exception as e:  # pylint: disable=broad-except
-            log.error("JSON Render failed for: %s\n%s", stdout, stderr)
-            log.error(str(e))
-
-        # If for some reason the json load fails, return the stdout
-        return stdout
+        return {"local": salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode)}
 
 
 def running(concurrent=False):
@@ -329,12 +308,7 @@ def _check_queue(queue, kwargs):
 
 
 def _get_initial_pillar(opts):
-    return (
-        __pillar__
-        if __opts__["__cli"] == "salt-call"
-        and opts["pillarenv"] == __opts__["pillarenv"]
-        else None
-    )
+    return __pillar__.value() if opts["pillarenv"] == __opts__["pillarenv"] else None
 
 
 def low(data, **kwargs):
@@ -353,10 +327,11 @@ def low(data, **kwargs):
     chunks = [data]
     with salt.client.ssh.state.SSHHighState(
         __opts__,
-        __pillar__.value(),
+        None,
         __salt__.value(),
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=__pillar__.value(),
     ) as st_:
         for chunk in chunks:
             chunk["__id__"] = (
@@ -368,7 +343,9 @@ def low(data, **kwargs):
         file_refs = salt.client.ssh.state.lowstate_file_refs(
             chunks,
             _merge_extra_filerefs(
-                kwargs.get("extra_filerefs", ""), __opts__.get("extra_filerefs", "")
+                kwargs.get("extra_filerefs", ""),
+                __opts__.get("extra_filerefs", ""),
+                __context__.get("_cp_extra_filerefs", ""),
             ),
         )
         roster = salt.roster.Roster(__opts__, __opts__.get("roster", "flat"))
@@ -395,7 +372,7 @@ def low(data, **kwargs):
             **st_kwargs,
         )
         single.shell.send(trans_tar, "{}/salt_state.tgz".format(__opts__["thin_dir"]))
-        stdout, stderr, _ = single.cmd_block()
+        stdout, stderr, retcode = single.cmd_block()
 
         # Clean up our tar
         try:
@@ -403,15 +380,7 @@ def low(data, **kwargs):
         except OSError:
             pass
 
-        # Read in the JSON data and return the data structure
-        try:
-            return salt.utils.json.loads(stdout)
-        except Exception as e:  # pylint: disable=broad-except
-            log.error("JSON Render failed for: %s\n%s", stdout, stderr)
-            log.error(str(e))
-
-        # If for some reason the json load fails, return the stdout
-        return stdout
+        return {"local": salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode)}
 
 
 def _get_test_value(test=None, **kwargs):
@@ -440,23 +409,34 @@ def high(data, **kwargs):
 
         salt '*' state.high '{"vim": {"pkg": ["installed"]}}'
     """
-    __pillar__.update(kwargs.get("pillar", {}))
     st_kwargs = __salt__.kwargs
     __opts__["grains"] = __grains__.value()
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
+    pillar_override = kwargs.get("pillar")
+    initial_pillar = _get_initial_pillar(opts)
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        pillar_override,
         __salt__.value(),
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=initial_pillar,
     ) as st_:
+        try:
+            pillar = st_.opts["pillar"].value()
+        except AttributeError:
+            pillar = st_.opts["pillar"]
+        if pillar_override is not None or initial_pillar is None:
+            # Ensure other wrappers use the correct pillar
+            __pillar__.update(pillar)
         st_.push_active()
         chunks = st_.state.compile_high_data(data)
         file_refs = salt.client.ssh.state.lowstate_file_refs(
             chunks,
             _merge_extra_filerefs(
-                kwargs.get("extra_filerefs", ""), opts.get("extra_filerefs", "")
+                kwargs.get("extra_filerefs", ""),
+                opts.get("extra_filerefs", ""),
+                __context__.get("_cp_extra_filerefs", ""),
             ),
         )
 
@@ -469,7 +449,7 @@ def high(data, **kwargs):
             __context__["fileclient"],
             chunks,
             file_refs,
-            __pillar__.value(),
+            pillar,
             st_kwargs["id_"],
             roster_grains,
         )
@@ -485,7 +465,7 @@ def high(data, **kwargs):
             **st_kwargs,
         )
         single.shell.send(trans_tar, "{}/salt_state.tgz".format(opts["thin_dir"]))
-        stdout, stderr, _ = single.cmd_block()
+        stdout, stderr, retcode = single.cmd_block()
 
         # Clean up our tar
         try:
@@ -493,15 +473,7 @@ def high(data, **kwargs):
         except OSError:
             pass
 
-        # Read in the JSON data and return the data structure
-        try:
-            return salt.utils.json.loads(stdout)
-        except Exception as e:  # pylint: disable=broad-except
-            log.error("JSON Render failed for: %s\n%s", stdout, stderr)
-            log.error(str(e))
-
-        # If for some reason the json load fails, return the stdout
-        return stdout
+        return {"local": salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode)}
 
 
 def apply_(mods=None, **kwargs):
@@ -677,29 +649,40 @@ def highstate(test=None, **kwargs):
         salt '*' state.highstate exclude=sls_to_exclude
         salt '*' state.highstate exclude="[{'id': 'id_to_exclude'}, {'sls': 'sls_to_exclude'}]"
     """
-    __pillar__.update(kwargs.get("pillar", {}))
     st_kwargs = __salt__.kwargs
     __opts__["grains"] = __grains__.value()
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
     opts["test"] = _get_test_value(test, **kwargs)
+    pillar_override = kwargs.get("pillar")
+    initial_pillar = _get_initial_pillar(opts)
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        pillar_override,
         __salt__.value(),
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=initial_pillar,
     ) as st_:
         if not _check_pillar(kwargs, st_.opts["pillar"]):
             __context__["retcode"] = salt.defaults.exitcodes.EX_PILLAR_FAILURE
             err = ["Pillar failed to render with the following messages:"]
             err += st_.opts["pillar"]["_errors"]
             return err
+        try:
+            pillar = st_.opts["pillar"].value()
+        except AttributeError:
+            pillar = st_.opts["pillar"]
+        if pillar_override is not None or initial_pillar is None:
+            # Ensure other wrappers use the correct pillar
+            __pillar__.update(pillar)
         st_.push_active()
         chunks = st_.compile_low_chunks(context=__context__.value())
         file_refs = salt.client.ssh.state.lowstate_file_refs(
             chunks,
             _merge_extra_filerefs(
-                kwargs.get("extra_filerefs", ""), opts.get("extra_filerefs", "")
+                kwargs.get("extra_filerefs", ""),
+                opts.get("extra_filerefs", ""),
+                __context__.get("_cp_extra_filerefs", ""),
             ),
         )
         # Check for errors
@@ -717,7 +700,7 @@ def highstate(test=None, **kwargs):
             __context__["fileclient"],
             chunks,
             file_refs,
-            __pillar__.value(),
+            pillar,
             st_kwargs["id_"],
             roster_grains,
         )
@@ -733,7 +716,7 @@ def highstate(test=None, **kwargs):
             **st_kwargs,
         )
         single.shell.send(trans_tar, "{}/salt_state.tgz".format(opts["thin_dir"]))
-        stdout, stderr, _ = single.cmd_block()
+        stdout, stderr, retcode = single.cmd_block()
 
         # Clean up our tar
         try:
@@ -741,15 +724,7 @@ def highstate(test=None, **kwargs):
         except OSError:
             pass
 
-        # Read in the JSON data and return the data structure
-        try:
-            return salt.utils.json.loads(stdout)
-        except Exception as e:  # pylint: disable=broad-except
-            log.error("JSON Render failed for: %s\n%s", stdout, stderr)
-            log.error(str(e))
-
-        # If for some reason the json load fails, return the stdout
-        return stdout
+        return {"local": salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode)}
 
 
 def top(topfn, test=None, **kwargs):
@@ -764,26 +739,32 @@ def top(topfn, test=None, **kwargs):
         salt '*' state.top reverse_top.sls exclude=sls_to_exclude
         salt '*' state.top reverse_top.sls exclude="[{'id': 'id_to_exclude'}, {'sls': 'sls_to_exclude'}]"
     """
-    __pillar__.update(kwargs.get("pillar", {}))
     st_kwargs = __salt__.kwargs
     __opts__["grains"] = __grains__.value()
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
-    if salt.utils.args.test_mode(test=test, **kwargs):
-        opts["test"] = True
-    else:
-        opts["test"] = __opts__.get("test", None)
+    opts["test"] = _get_test_value(test, **kwargs)
+    pillar_override = kwargs.get("pillar")
+    initial_pillar = _get_initial_pillar(opts)
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        pillar_override,
         __salt__.value(),
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=initial_pillar,
     ) as st_:
         if not _check_pillar(kwargs, st_.opts["pillar"]):
             __context__["retcode"] = salt.defaults.exitcodes.EX_PILLAR_FAILURE
             err = ["Pillar failed to render with the following messages:"]
             err += st_.opts["pillar"]["_errors"]
             return err
+        try:
+            pillar = st_.opts["pillar"].value()
+        except AttributeError:
+            pillar = st_.opts["pillar"]
+        if pillar_override is not None or initial_pillar is None:
+            # Ensure other wrappers use the correct pillar
+            __pillar__.update(pillar)
         st_.opts["state_top"] = os.path.join("salt://", topfn)
         st_.push_active()
         chunks = st_.compile_low_chunks(context=__context__.value())
@@ -795,7 +776,9 @@ def top(topfn, test=None, **kwargs):
         file_refs = salt.client.ssh.state.lowstate_file_refs(
             chunks,
             _merge_extra_filerefs(
-                kwargs.get("extra_filerefs", ""), opts.get("extra_filerefs", "")
+                kwargs.get("extra_filerefs", ""),
+                opts.get("extra_filerefs", ""),
+                __context__.get("_cp_extra_filerefs", ""),
             ),
         )
 
@@ -808,7 +791,7 @@ def top(topfn, test=None, **kwargs):
             __context__["fileclient"],
             chunks,
             file_refs,
-            __pillar__.value(),
+            pillar,
             st_kwargs["id_"],
             roster_grains,
         )
@@ -824,7 +807,7 @@ def top(topfn, test=None, **kwargs):
             **st_kwargs,
         )
         single.shell.send(trans_tar, "{}/salt_state.tgz".format(opts["thin_dir"]))
-        stdout, stderr, _ = single.cmd_block()
+        stdout, stderr, retcode = single.cmd_block()
 
         # Clean up our tar
         try:
@@ -832,15 +815,7 @@ def top(topfn, test=None, **kwargs):
         except OSError:
             pass
 
-        # Read in the JSON data and return the data structure
-        try:
-            return salt.utils.json.loads(stdout)
-        except Exception as e:  # pylint: disable=broad-except
-            log.error("JSON Render failed for: %s\n%s", stdout, stderr)
-            log.error(str(e))
-
-        # If for some reason the json load fails, return the stdout
-        return stdout
+        return {"local": salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode)}
 
 
 def show_highstate(**kwargs):
@@ -855,18 +830,28 @@ def show_highstate(**kwargs):
     """
     __opts__["grains"] = __grains__.value()
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
+    pillar_override = kwargs.get("pillar")
+    initial_pillar = _get_initial_pillar(opts)
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        pillar_override,
         __salt__,
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=initial_pillar,
     ) as st_:
         if not _check_pillar(kwargs, st_.opts["pillar"]):
             __context__["retcode"] = salt.defaults.exitcodes.EX_PILLAR_FAILURE
             err = ["Pillar failed to render with the following messages:"]
             err += st_.opts["pillar"]["_errors"]
             return err
+        try:
+            pillar = st_.opts["pillar"].value()
+        except AttributeError:
+            pillar = st_.opts["pillar"]
+        if pillar_override is not None or initial_pillar is None:
+            # Ensure other wrappers use the correct pillar
+            __pillar__.update(pillar)
         st_.push_active()
         chunks = st_.compile_highstate(context=__context__.value())
         # Check for errors
@@ -891,10 +876,11 @@ def show_lowstate(**kwargs):
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        None,
         __salt__,
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=_get_initial_pillar(opts),
     ) as st_:
         if not _check_pillar(kwargs, st_.opts["pillar"]):
             __context__["retcode"] = salt.defaults.exitcodes.EX_PILLAR_FAILURE
@@ -939,7 +925,6 @@ def sls_id(id_, mods, test=None, queue=False, **kwargs):
 
         salt '*' state.sls_id my_state my_module,a_common_module
     """
-    __pillar__.update(kwargs.get("pillar", {}))
     st_kwargs = __salt__.kwargs
     conflict = _check_queue(queue, kwargs)
     if conflict is not None:
@@ -953,12 +938,15 @@ def sls_id(id_, mods, test=None, queue=False, **kwargs):
     if opts["saltenv"] is None:
         opts["saltenv"] = "base"
 
+    pillar_override = kwargs.get("pillar")
+    initial_pillar = _get_initial_pillar(opts)
     with salt.client.ssh.state.SSHHighState(
         __opts__,
-        __pillar__.value(),
+        pillar_override,
         __salt__,
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=initial_pillar,
     ) as st_:
 
         if not _check_pillar(kwargs, st_.opts["pillar"]):
@@ -967,6 +955,13 @@ def sls_id(id_, mods, test=None, queue=False, **kwargs):
             err += __pillar__["_errors"]
             return err
 
+        try:
+            pillar = st_.opts["pillar"].value()
+        except AttributeError:
+            pillar = st_.opts["pillar"]
+        if pillar_override is not None or initial_pillar is None:
+            # Ensure other wrappers use the correct pillar
+            __pillar__.update(pillar)
         split_mods = _parse_mods(mods)
         st_.push_active()
         high_, errors = st_.render_highstate(
@@ -992,8 +987,7 @@ def sls_id(id_, mods, test=None, queue=False, **kwargs):
                 )
             )
 
-        ret = _ssh_state(chunk, st_kwargs, kwargs, test=test)
-        _set_retcode(ret, highstate=highstate)
+        ret = _ssh_state(chunk, st_kwargs, kwargs, pillar, test=test)
         # Work around Windows multiprocessing bug, set __opts__['test'] back to
         # value from before this function was run.
         __opts__["test"] = orig_test
@@ -1011,25 +1005,31 @@ def show_sls(mods, saltenv="base", test=None, **kwargs):
 
         salt '*' state.show_sls core,edit.vim dev
     """
-    __pillar__.update(kwargs.get("pillar", {}))
     __opts__["grains"] = __grains__.value()
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
-    if salt.utils.args.test_mode(test=test, **kwargs):
-        opts["test"] = True
-    else:
-        opts["test"] = __opts__.get("test", None)
+    opts["test"] = _get_test_value(test, **kwargs)
+    pillar_override = kwargs.get("pillar")
+    initial_pillar = _get_initial_pillar(opts)
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        pillar_override,
         __salt__,
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=initial_pillar,
     ) as st_:
         if not _check_pillar(kwargs, st_.opts["pillar"]):
             __context__["retcode"] = salt.defaults.exitcodes.EX_PILLAR_FAILURE
             err = ["Pillar failed to render with the following messages:"]
             err += st_.opts["pillar"]["_errors"]
             return err
+        try:
+            pillar = st_.opts["pillar"].value()
+        except AttributeError:
+            pillar = st_.opts["pillar"]
+        if pillar_override is not None or initial_pillar is None:
+            # Ensure other wrappers use the correct pillar
+            __pillar__.update(pillar)
         st_.push_active()
         mods = _parse_mods(mods)
         high_data, errors = st_.render_highstate(
@@ -1065,26 +1065,31 @@ def show_low_sls(mods, saltenv="base", test=None, **kwargs):
 
         salt '*' state.show_low_sls core,edit.vim dev
     """
-    __pillar__.update(kwargs.get("pillar", {}))
     __opts__["grains"] = __grains__.value()
-
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
-    if salt.utils.args.test_mode(test=test, **kwargs):
-        opts["test"] = True
-    else:
-        opts["test"] = __opts__.get("test", None)
+    opts["test"] = _get_test_value(test, **kwargs)
+    pillar_override = kwargs.get("pillar")
+    initial_pillar = _get_initial_pillar(opts)
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        pillar_override,
         __salt__,
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=initial_pillar,
     ) as st_:
         if not _check_pillar(kwargs, st_.opts["pillar"]):
             __context__["retcode"] = salt.defaults.exitcodes.EX_PILLAR_FAILURE
             err = ["Pillar failed to render with the following messages:"]
             err += st_.opts["pillar"]["_errors"]
             return err
+        try:
+            pillar = st_.opts["pillar"].value()
+        except AttributeError:
+            pillar = st_.opts["pillar"]
+        if pillar_override is not None or initial_pillar is None:
+            # Ensure other wrappers use the correct pillar
+            __pillar__.update(pillar)
         st_.push_active()
         mods = _parse_mods(mods)
         high_data, errors = st_.render_highstate(
@@ -1122,10 +1127,11 @@ def show_top(**kwargs):
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
     with salt.client.ssh.state.SSHHighState(
         opts,
-        __pillar__.value(),
+        None,
         __salt__,
         __context__["fileclient"],
         context=__context__.value(),
+        initial_pillar=_get_initial_pillar(opts),
     ) as st_:
         top_data = st_.get_top(context=__context__.value())
         errors = []
@@ -1171,17 +1177,22 @@ def single(fun, name, test=None, **kwargs):
     opts = salt.utils.state.get_sls_opts(__opts__, **kwargs)
 
     # Set test mode
-    if salt.utils.args.test_mode(test=test, **kwargs):
-        opts["test"] = True
-    else:
-        opts["test"] = __opts__.get("test", None)
+    opts["test"] = _get_test_value(test, **kwargs)
 
     # Get the override pillar data
-    __pillar__.update(kwargs.get("pillar", {}))
+    # This needs to be removed from the kwargs, they are called
+    # as a lowstate with one item, not a single chunk
+    pillar_override = kwargs.pop("pillar", None)
 
     # Create the State environment
-    st_ = salt.client.ssh.state.SSHState(opts, __pillar__)
+    st_ = salt.client.ssh.state.SSHState(
+        opts, pillar_override, initial_pillar=_get_initial_pillar(opts)
+    )
 
+    try:
+        pillar = st_.opts["pillar"].value()
+    except AttributeError:
+        pillar = st_.opts["pillar"]
     # Verify the low chunk
     err = st_.verify_data(kwargs)
     if err:
@@ -1196,7 +1207,9 @@ def single(fun, name, test=None, **kwargs):
     file_refs = salt.client.ssh.state.lowstate_file_refs(
         chunks,
         _merge_extra_filerefs(
-            kwargs.get("extra_filerefs", ""), opts.get("extra_filerefs", "")
+            kwargs.get("extra_filerefs", ""),
+            opts.get("extra_filerefs", ""),
+            __context__.get("_cp_extra_filerefs", ""),
         ),
     )
 
@@ -1208,7 +1221,7 @@ def single(fun, name, test=None, **kwargs):
         __context__["fileclient"],
         chunks,
         file_refs,
-        __pillar__.value(),
+        pillar,
         st_kwargs["id_"],
         roster_grains,
     )
@@ -1234,7 +1247,7 @@ def single(fun, name, test=None, **kwargs):
     single.shell.send(trans_tar, "{}/salt_state.tgz".format(opts["thin_dir"]))
 
     # Run the state.pkg command on the target
-    stdout, stderr, _ = single.cmd_block()
+    stdout, stderr, retcode = single.cmd_block()
 
     # Clean up our tar
     try:
@@ -1242,12 +1255,19 @@ def single(fun, name, test=None, **kwargs):
     except OSError:
         pass
 
-    # Read in the JSON data and return the data structure
-    try:
-        return salt.utils.json.loads(stdout)
-    except Exception as e:  # pylint: disable=broad-except
-        log.error("JSON Render failed for: %s\n%s", stdout, stderr)
-        log.error(str(e))
+    return {"local": salt.client.ssh.wrapper.parse_ret(stdout, stderr, retcode)}
 
-    # If for some reason the json load fails, return the stdout
-    return stdout
+
+def test(*args, **kwargs):
+    """
+    .. versionadded:: 3001
+
+    Alias for `state.apply` with the kwarg `test` forced to `True`.
+
+    This is a nicety to avoid the need to type out `test=True` and the possibility of
+    a typo causing changes you do not intend.
+    """
+    kwargs["test"] = True
+    ret = apply_(*args, **kwargs)
+
+    return ret

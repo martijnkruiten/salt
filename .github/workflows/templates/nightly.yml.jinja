@@ -1,6 +1,5 @@
 <%- set gh_environment = gh_environment|default("nightly") %>
 <%- set skip_test_coverage_check = skip_test_coverage_check|default("false") %>
-<%- set skip_junit_reports_check = skip_junit_reports_check|default("false") %>
 <%- set prepare_workflow_skip_test_suite = "${{ inputs.skip-salt-test-suite && ' --skip-tests' || '' }}" %>
 <%- set prepare_workflow_skip_pkg_test_suite = "${{ inputs.skip-salt-pkg-test-suite && ' --skip-pkg-tests' || '' }}" %>
 <%- set prepare_workflow_if_check = prepare_workflow_if_check|default("${{ fromJSON(needs.workflow-requirements.outputs.requirements-met) }}") %>
@@ -28,7 +27,7 @@ on:
         description: Skip running the Salt packages test suite.
   schedule:
     # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#onschedule
-    - cron: '0 1 * * *'  # Every day at 1AM
+    - cron: '0 0 * * *'  # Every day at 0AM
 
 <%- endblock on %>
 
@@ -58,7 +57,7 @@ concurrency:
   <%- do conclusion_needs.append('notify-slack') %>
   notify-slack:
     name: Notify Slack
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "linux", "x86_64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     environment: <{ gh_environment }>
     needs:
       <%- for need in prepare_workflow_needs.iter(consume=False) %>
@@ -157,7 +156,7 @@ concurrency:
       <%- endif %>
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Get Salt Project GitHub Actions Bot Environment
         run: |
@@ -167,9 +166,13 @@ concurrency:
 
       - name: Setup Python Tools Scripts
         uses: ./.github/actions/setup-python-tools-scripts
+        with:
+          cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
 
       - name: Download Repository Artifact
         uses: actions/download-artifact@v3
+        # This needs to be actions/download-artifact@v3 because we upload multiple artifacts
+        # under the same name something that actions/upload-artifact@v4 does not do.
         with:
           name: salt-${{ needs.prepare-workflow.outputs.salt-version }}-<{ gh_environment }>-repo
           path: repo/
